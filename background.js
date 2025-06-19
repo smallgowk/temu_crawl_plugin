@@ -280,45 +280,112 @@ async function handleFetchTracking(message, sender, sendResponse) {
 async function handleFetchTemuProducts(message, sender, sendResponse) {
     const API_URL = 'http://iamhere.vn:89/api/ggsheet/pushTemuProduct';
     const { sheetId, tabId } = message;
+    const crawledProductIds = new Set(); // Lưu trữ productId đã crawl
+    let hasMoreItems = true;
+    let pageCount = 0;
+    const MAX_PAGES = 10; // Giới hạn số page để tránh loop vô hạn
+
     try {
-        currentTrackingStatus = { status: 'Crawling product links...', isTaskRunning: true };
-        chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: currentTrackingStatus });
-        // Inject script để lấy các thẻ a đúng định dạng
-        const [{ result: products }] = await chrome.scripting.executeScript({
-            target: { tabId },
-            func: () => {
-                const anchors = Array.from(document.querySelectorAll('a[href]'));
-                const regex = /^\/(.*)-(\d{10,})\.html$/;
-                const list = anchors.map(a => {
-                    const match = a.getAttribute('href').match(regex);
-                    // Chỉ lấy nếu có span class C9HMW0KN bên trong
-                    if (match && a.querySelector('span.C9HMW0KN')) {
-                        const productId = match[2];
-                        const productLink = `https://www.temu.com${a.getAttribute('href')}`;
-                        return { productId, productLink };
-                    }
-                    return null;
-                }).filter(Boolean);
-                return list;
+        while (hasMoreItems && pageCount < MAX_PAGES && isTaskRunning) {
+            pageCount++;
+            currentTrackingStatus = { status: `Crawling page ${pageCount}...`, isTaskRunning: true };
+            chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: currentTrackingStatus });
+
+            // Crawl items trên page hiện tại
+            const [{ result: newProducts }] = await chrome.scripting.executeScript({
+                target: { tabId },
+                func: (existingIds) => {
+                    const anchors = Array.from(document.querySelectorAll('a[href]'));
+                    const regex = /^\/(.*)-(\d{10,})\.html$/;
+                    const list = anchors.map(a => {
+                        const match = a.getAttribute('href').match(regex);
+                        if (match && a.querySelector('span.C9HMW0KN')) {
+                            const productId = match[2];
+                            // Chỉ lấy các item chưa crawl
+                            if (!existingIds.includes(productId)) {
+                                const productLink = `https://www.temu.com${a.getAttribute('href')}`;
+                                return { productId, productLink };
+                            }
+                        }
+                        return null;
+                    }).filter(Boolean);
+                    return list;
+                },
+                args: [Array.from(crawledProductIds)] // Truyền danh sách productId đã crawl
+            });
+
+            // Nếu tìm thấy items mới
+            if (newProducts && newProducts.length > 0) {
+                currentTrackingStatus = { status: `Found ${newProducts.length} new products on page ${pageCount}. Pushing to API...`, isTaskRunning: true };
+                chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: currentTrackingStatus });
+
+                // Gọi API với chỉ các items mới
+                const res = await fetch(API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        sheetId,
+                        signature: '11113',
+                        listProducts: newProducts
+                    })
+                });
+                if (!res.ok) throw new Error(`API pushTemuProduct failed for page ${pageCount}`);
+
+                // Lưu các productId đã crawl
+                newProducts.forEach(p => crawledProductIds.add(p.productId));
             }
-        });
-        if (!products || !Array.isArray(products) || products.length === 0) throw new Error('No products found!');
-        currentTrackingStatus = { status: `Found ${products.length} products. Pushing to API...`, isTaskRunning: true };
-        chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: currentTrackingStatus });
-        // Gọi API pushTemuProduct
-        const res = await fetch(API_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                sheetId,
-                signature: '11113',
-                listProducts: products
-            })
-        });
-        if (!res.ok) throw new Error('API pushTemuProduct failed');
-        currentTrackingStatus = { status: 'Push thành công!', isTaskRunning: false };
+
+            // Tìm và click button "See more"
+            const [{ result: clickResult }] = await chrome.scripting.executeScript({
+                target: { tabId },
+                func: () => {
+                    console.log('Searching for See more button...');
+                    
+                    // Tìm button theo class chính xác
+                    const button = document.querySelector('div._2ugbvrpI._3E4sGl93._28_m8Owy.R8mNGZXv._2rMaxXAr[role="button"]');
+                    console.log('Found button:', button);
+
+                    if (button) {
+                        console.log('Found button, attempting to click...');
+                        try {
+                            button.click();
+                            console.log('Direct click successful');
+                            return { found: true, clicked: true };
+                        } catch (error) {
+                            console.error('Error clicking button:', error);
+                            return { found: true, clicked: false, error: error.message };
+                        }
+                    }
+                    
+                    console.log('Button not found');
+                    return { found: false, clicked: false };
+                }
+            });
+
+            console.log('Click result:', clickResult);
+
+            if (!clickResult.found) {
+                hasMoreItems = false;
+                break;
+            }
+
+            if (clickResult.found && !clickResult.clicked) {
+                console.error('Found button but failed to click:', clickResult.error);
+                throw new Error('Failed to click See more button');
+            }
+
+            // Tăng thời gian đợi để đảm bảo trang load xong
+            await new Promise(resolve => setTimeout(resolve, 5000));
+        }
+
+        const finalStatus = pageCount >= MAX_PAGES 
+            ? `Reached maximum ${MAX_PAGES} pages. Total products: ${crawledProductIds.size}`
+            : `Completed! Total products: ${crawledProductIds.size} from ${pageCount} pages`;
+
+        currentTrackingStatus = { status: finalStatus, isTaskRunning: false };
         isTaskRunning = false;
         chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: currentTrackingStatus });
+
     } catch (error) {
         currentTrackingStatus = { status: 'Error: ' + error.message, isTaskRunning: false };
         isTaskRunning = false;
