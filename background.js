@@ -69,11 +69,38 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             sendResponse({ success: false, message: 'Task already running' });
             return true;
         }
-        isTaskRunning = true;
-        currentTrackingStatus = { ...currentTrackingStatus, isTaskRunning: true };
-        lastTrackingMessage = message;
-        chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: { ...currentTrackingStatus, status: 'Started crawling products...', isTaskRunning: true } });
-        handleFetchTemuProducts(message, sender, sendResponse);
+
+        // Lấy thông tin tab hiện tại một cách tường minh để tránh lỗi
+        chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+            if (!tabs || tabs.length === 0) {
+                isTaskRunning = false;
+                sendResponse({ success: false, message: 'Could not find active tab.' });
+                chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: { status: 'Error: No active tab found.', isTaskRunning: false } });
+                return;
+            }
+            const activeTab = tabs[0];
+            
+            isTaskRunning = true;
+            const messageForHandler = { 
+                ...message, 
+                tabId: activeTab.id, 
+                tabUrl: activeTab.url 
+            };
+            
+            currentTrackingStatus = { ...currentTrackingStatus, isTaskRunning: true, status: 'Starting...' };
+            lastTrackingMessage = messageForHandler;
+            chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: currentTrackingStatus });
+            
+            handleFetchTemuProducts(messageForHandler, sendResponse);
+
+            sendResponse({ success: true, message: 'Task started' });
+        });
+        
+        return true; // Báo hiệu rằng sendResponse sẽ được gọi bất đồng bộ
+    } else if (message.type === 'STOP_FETCH') {
+        isTaskRunning = false;
+        currentTrackingStatus = { ...currentTrackingStatus, isTaskRunning: false };
+        chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: { ...currentTrackingStatus, status: 'Stopped by user.', isTaskRunning: false } });
         sendResponse({ success: true });
         return true;
     }
@@ -277,10 +304,41 @@ async function handleFetchTracking(message, sender, sendResponse) {
     }
 }
 
-async function handleFetchTemuProducts(message, sender, sendResponse) {
-    const API_URL = 'http://iamhere.vn:89/api/ggsheet/pushTemuProduct';
-    const { sheetId, tabId } = message;
-    const crawledProductIds = new Set(); // Lưu trữ productId đã crawl
+async function handleFetchTemuProducts(message, sendResponse) {
+    const LIST_API_URL = 'http://iamhere.vn:89/api/ggsheet/pushTemuProduct';
+    const DETAIL_API_URL = 'http://iamhere.vn:89/api/ggsheet/pushTemuProductDetail';
+    const { sheetId, tabId, tabUrl } = message;
+
+    // --- Logic tạo baseSignature ---
+    let baseSignature = 'general_crawl';
+    const sanitizeForSheetName = (name) => {
+        if (!name) return 'untitled';
+        // Chuyển thành chữ thường, thay thế khoảng trắng và các ký tự không phải chữ/số bằng dấu gạch dưới
+        return decodeURIComponent(name).trim().toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '_');
+    };
+
+    try {
+        const url = new URL(tabUrl);
+        if (url.pathname.includes('/search_result.html')) {
+            const searchKey = url.searchParams.get('search_key');
+            if (searchKey) {
+                baseSignature = sanitizeForSheetName(searchKey);
+            }
+        } else if (url.pathname.match(/-m-\d+\.html$/)) {
+            const [{ result: h1Text }] = await chrome.scripting.executeScript({
+                target: { tabId },
+                func: () => document.querySelector('h1.PX7EseE2._2DshZJ_y')?.textContent
+            });
+            if (h1Text) {
+                baseSignature = sanitizeForSheetName(h1Text);
+            }
+        }
+    } catch (e) {
+        console.error("Could not generate base signature, using default.", e);
+    }
+    // --- Kết thúc logic tạo baseSignature ---
+
+    const crawledProductIds = new Set();
     let hasMoreItems = true;
     let pageCount = 0;
     const MAX_PAGES = 10; // Giới hạn số page để tránh loop vô hạn
@@ -288,7 +346,8 @@ async function handleFetchTemuProducts(message, sender, sendResponse) {
     try {
         while (hasMoreItems && pageCount < MAX_PAGES && isTaskRunning) {
             pageCount++;
-            currentTrackingStatus = { status: `Crawling page ${pageCount}...`, isTaskRunning: true };
+            const currentSignature = `${baseSignature}_page_${pageCount}`; // Tạo signature động với định dạng mới
+            currentTrackingStatus = { status: `Crawling page ${pageCount} for '${currentSignature}'...`, isTaskRunning: true };
             chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: currentTrackingStatus });
 
             // Crawl items trên page hiện tại
@@ -320,19 +379,147 @@ async function handleFetchTemuProducts(message, sender, sendResponse) {
                 chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: currentTrackingStatus });
 
                 // Gọi API với chỉ các items mới
-                const res = await fetch(API_URL, {
+                const listRes = await fetch(LIST_API_URL, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         sheetId,
-                        signature: '11113',
+                        signature: currentSignature, // Sử dụng signature động
                         listProducts: newProducts
                     })
                 });
-                if (!res.ok) throw new Error(`API pushTemuProduct failed for page ${pageCount}`);
+                if (!listRes.ok) throw new Error(`API pushTemuProduct failed for page ${pageCount}`);
 
                 // Lưu các productId đã crawl
                 newProducts.forEach(p => crawledProductIds.add(p.productId));
+                
+                // Crawl chi tiết từng sản phẩm
+                for (const product of newProducts) {
+                    if (!isTaskRunning) {
+                        chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: { status: 'Task stopped by user', isTaskRunning: false } });
+                        return;
+                    }
+                    currentTrackingStatus = { status: `(${crawledProductIds.size}) Crawling detail for ${product.productId}...`, isTaskRunning: true };
+                    chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: currentTrackingStatus });
+                    
+                    // Open a new tab for the product link
+                    const detailTab = await chrome.tabs.create({ url: product.productLink, active: false });
+
+                    try {
+                        // Lấy rawData từ script tag, với cơ chế đợi thông minh đến khi data được điền
+                        const [{ result: rawDataString }] = await chrome.scripting.executeScript({
+                            target: { tabId: detailTab.id },
+                            func: async () => {
+                                const totalTimeout = 20000; // Đợi tối đa 20 giây
+                                const pollInterval = 500;   // Kiểm tra mỗi 500ms
+                                let elapsedTime = 0;
+
+                                while (elapsedTime < totalTimeout) {
+                                    const scripts = Array.from(document.querySelectorAll('script'));
+                                    const targetPrefix = 'window.rawData=';
+                                    for (const script of scripts) {
+                                        const content = script.textContent;
+                                        const rawDataIndex = content.indexOf(targetPrefix);
+                                        if (rawDataIndex !== -1) {
+                                            let rawDataStr = content.substring(rawDataIndex + targetPrefix.length).trim();
+                                            const lastBraceIndex = rawDataStr.lastIndexOf('}');
+                                            if (lastBraceIndex !== -1) {
+                                                rawDataStr = rawDataStr.substring(0, lastBraceIndex + 1);
+                                            }
+                                            
+                                            // Kiểm tra xem data đã đủ chưa (goods và delivery không rỗng)
+                                            try {
+                                                const parsed = JSON.parse(rawDataStr);
+                                                if (parsed && parsed.store && 
+                                                    parsed.store.goods && Object.keys(parsed.store.goods).length > 0 &&
+                                                    parsed.store.delivery && Object.keys(parsed.store.delivery).length > 0) {
+                                                    return rawDataStr; // Dữ liệu đã đủ, trả về
+                                                }
+                                            } catch (e) { /* Bỏ qua lỗi parse, tiếp tục đợi */ }
+                                        }
+                                    }
+                                    // Đợi rồi thử lại
+                                    await new Promise(resolve => setTimeout(resolve, pollInterval));
+                                    elapsedTime += pollInterval;
+                                }
+
+                                // Hết giờ, trả về null để logic bên ngoài xử lý
+                                return null;
+                            }
+                        });
+
+                        if (rawDataString) {
+                            // Đóng tab chi tiết
+                            await chrome.tabs.remove(detailTab.id);
+
+                            currentTrackingStatus = { status: `(${crawledProductIds.size}) Pushing detail for ${product.productId}...`, isTaskRunning: true };
+                            chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: currentTrackingStatus });
+
+                            let productDetailForApi = rawDataString;
+                            try {
+                                const detailObj = JSON.parse(rawDataString);
+                                if (detailObj && detailObj.store) {
+                                    // Chỉ giữ lại các key cần thiết
+                                    const cleanedStore = {
+                                        goods: detailObj.store.goods,
+                                        delivery: detailObj.store.delivery
+                                    };
+                                    const finalObject = { store: cleanedStore };
+                                    productDetailForApi = JSON.stringify(finalObject);
+                                }
+                            } catch (e) {
+                                console.error('Could not clean JSON, sending raw data.', e);
+                            }
+
+                            // Gọi API pushTemuProductDetail
+                            const detailRes = await fetch(DETAIL_API_URL, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    sheetId,
+                                    signature: currentSignature, // Sử dụng signature động
+                                    productId: product.productId,
+                                    productDetail: productDetailForApi
+                                })
+                            });
+
+                            const detailResJson = await detailRes.json();
+                        } else {
+                            // Nếu không thấy rawData, kiểm tra captcha bằng cách tìm div#Picture
+                            const [{ result: hasCaptcha }] = await chrome.scripting.executeScript({
+                                target: { tabId: detailTab.id },
+                                func: () => !!document.getElementById('Picture')
+                            });
+
+                            if (hasCaptcha) {
+                                // Dừng process, hiển thị thông báo, không đóng tab
+                                isTaskRunning = false;
+                                currentTrackingStatus = { status: 'Vui lòng nhập captcha để tiếp tục', isTaskRunning: false };
+                                chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: currentTrackingStatus });
+                                
+                                // Focus vào tab captcha
+                                await chrome.tabs.update(detailTab.id, { active: true });
+                                return; // Dừng toàn bộ function
+                            } else {
+                                // Không tìm thấy dữ liệu và cũng không phải captcha -> Dừng toàn bộ process
+                                isTaskRunning = false;
+                                const statusMessage = `Không tìm thấy dữ liệu cho sản phẩm ${product.productId}. Đã dừng.`;
+                                console.error(statusMessage, `URL: ${product.productLink}`);
+                                currentTrackingStatus = { status: statusMessage, isTaskRunning: false };
+                                chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: currentTrackingStatus });
+
+                                // Focus vào tab để user kiểm tra
+                                await chrome.tabs.update(detailTab.id, { active: true });
+                                return; // Dừng toàn bộ function
+                            }
+                        }
+                    } catch (error) {
+                        console.error('Error in detail crawling:', error);
+                        isTaskRunning = false;
+                        currentTrackingStatus = { status: 'Error: ' + error.message, isTaskRunning: false };
+                        chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: currentTrackingStatus });
+                    }
+                }
             }
 
             // Tìm và click button "See more"
