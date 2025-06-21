@@ -174,7 +174,7 @@ async function crawlPage(tabId) {
 }
 
 let pageCount = 0;
-const maxPages = 10;
+const maxPages = 50;
 
 // Main crawling function
 async function startCrawling(tabId) {
@@ -304,7 +304,13 @@ async function handleFetchTracking(message, sender, sendResponse) {
     }
 }
 
+// Main Logic
+// =================================================================================================
 async function handleFetchTemuProducts(message, sendResponse) {
+    // ================== CONFIG ==================
+    const ENABLE_CONSUMER = true; // Đặt thành false để chỉ chạy luồng Producer (crawl danh sách)
+    // ==========================================
+
     const LIST_API_URL = 'http://iamhere.vn:89/api/ggsheet/pushTemuProduct';
     const DETAIL_API_URL = 'http://iamhere.vn:89/api/ggsheet/pushTemuProductDetail';
     const { sheetId, tabId, tabUrl } = message;
@@ -313,7 +319,6 @@ async function handleFetchTemuProducts(message, sendResponse) {
     let baseSignature = 'general_crawl';
     const sanitizeForSheetName = (name) => {
         if (!name) return 'untitled';
-        // Chuyển thành chữ thường, thay thế khoảng trắng và các ký tự không phải chữ/số bằng dấu gạch dưới
         return decodeURIComponent(name).trim().toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/[\s-]+/g, '_');
     };
 
@@ -321,262 +326,214 @@ async function handleFetchTemuProducts(message, sendResponse) {
         const url = new URL(tabUrl);
         if (url.pathname.includes('/search_result.html')) {
             const searchKey = url.searchParams.get('search_key');
-            if (searchKey) {
-                baseSignature = sanitizeForSheetName(searchKey);
-            }
+            if (searchKey) baseSignature = sanitizeForSheetName(searchKey);
         } else if (url.pathname.match(/-m-\d+\.html$/)) {
             const [{ result: h1Text }] = await chrome.scripting.executeScript({
                 target: { tabId },
                 func: () => document.querySelector('h1.PX7EseE2._2DshZJ_y')?.textContent
             });
-            if (h1Text) {
-                baseSignature = sanitizeForSheetName(h1Text);
-            }
+            if (h1Text) baseSignature = sanitizeForSheetName(h1Text);
         }
     } catch (e) {
         console.error("Could not generate base signature, using default.", e);
     }
-    // --- Kết thúc logic tạo baseSignature ---
+    // --- Kết thúc logic ---
 
-    const crawledProductIds = new Set();
-    let hasMoreItems = true;
-    let pageCount = 0;
-    const MAX_PAGES = 10; // Giới hạn số page để tránh loop vô hạn
+    const productQueue = [];
+    let producerFinished = false;
 
-    try {
+    // --- Luồng PRODUCER: Crawl danh sách và đẩy vào queue ---
+    const runProducer = async () => {
+        const crawledProductIds = new Set();
+        let pageCount = 0;
+        const MAX_PAGES = 10;
+        let hasMoreItems = true;
+
         while (hasMoreItems && pageCount < MAX_PAGES && isTaskRunning) {
             pageCount++;
-            const currentSignature = `${baseSignature}_page_${pageCount}`; // Tạo signature động với định dạng mới
-            currentTrackingStatus = { status: `Crawling page ${pageCount} for '${currentSignature}'...`, isTaskRunning: true };
-            chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: currentTrackingStatus });
+            const currentSignature = `${baseSignature}_page_${pageCount}`;
+            chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: { status: `(Producer) Scanning page ${pageCount}...`, isTaskRunning: true } });
 
-            // Crawl items trên page hiện tại
-            const [{ result: newProducts }] = await chrome.scripting.executeScript({
+            const [{ result: productsOnPage }] = await chrome.scripting.executeScript({
                 target: { tabId },
-                func: (existingIds) => {
+                func: () => {
                     const anchors = Array.from(document.querySelectorAll('a[href]'));
                     const regex = /^\/(.*)-(\d{10,})\.html$/;
-                    const list = anchors.map(a => {
+                    return anchors.map(a => {
                         const match = a.getAttribute('href').match(regex);
                         if (match && a.querySelector('span.C9HMW0KN')) {
                             const productId = match[2];
-                            // Chỉ lấy các item chưa crawl
-                            if (!existingIds.includes(productId)) {
-                                const productLink = `https://www.temu.com${a.getAttribute('href')}`;
-                                return { productId, productLink };
-                            }
+                            const productLink = `https://www.temu.com${a.getAttribute('href')}`;
+                            return { productId, productLink };
                         }
                         return null;
                     }).filter(Boolean);
-                    return list;
-                },
-                args: [Array.from(crawledProductIds)] // Truyền danh sách productId đã crawl
+                }
             });
 
-            // Nếu tìm thấy items mới
-            if (newProducts && newProducts.length > 0) {
-                currentTrackingStatus = { status: `Found ${newProducts.length} new products on page ${pageCount}. Pushing to API...`, isTaskRunning: true };
-                chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: currentTrackingStatus });
+            const newProducts = productsOnPage ? productsOnPage.filter(p => !crawledProductIds.has(p.productId)) : [];
 
-                // Gọi API với chỉ các items mới
-                const listRes = await fetch(LIST_API_URL, {
+            if (newProducts.length > 0) {
+                newProducts.forEach(p => {
+                    crawledProductIds.add(p.productId);
+                    productQueue.push({ ...p, pageFoundOn: pageCount });
+                });
+
+                await fetch(LIST_API_URL, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        sheetId,
-                        signature: currentSignature, // Sử dụng signature động
-                        listProducts: newProducts
-                    })
+                    body: JSON.stringify({ sheetId, signature: currentSignature, listProducts: newProducts })
                 });
-                if (!listRes.ok) throw new Error(`API pushTemuProduct failed for page ${pageCount}`);
-
-                // Lưu các productId đã crawl
-                newProducts.forEach(p => crawledProductIds.add(p.productId));
-                
-                // Crawl chi tiết từng sản phẩm
-                for (const product of newProducts) {
-                    if (!isTaskRunning) {
-                        chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: { status: 'Task stopped by user', isTaskRunning: false } });
-                        return;
-                    }
-                    currentTrackingStatus = { status: `(${crawledProductIds.size}) Crawling detail for ${product.productId}...`, isTaskRunning: true };
-                    chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: currentTrackingStatus });
-                    
-                    // Open a new tab for the product link
-                    const detailTab = await chrome.tabs.create({ url: product.productLink, active: false });
-
-                    try {
-                        // Lấy rawData từ script tag, với cơ chế đợi thông minh đến khi data được điền
-                        const [{ result: rawDataString }] = await chrome.scripting.executeScript({
-                            target: { tabId: detailTab.id },
-                            func: async () => {
-                                const totalTimeout = 20000; // Đợi tối đa 20 giây
-                                const pollInterval = 500;   // Kiểm tra mỗi 500ms
-                                let elapsedTime = 0;
-
-                                while (elapsedTime < totalTimeout) {
-                                    const scripts = Array.from(document.querySelectorAll('script'));
-                                    const targetPrefix = 'window.rawData=';
-                                    for (const script of scripts) {
-                                        const content = script.textContent;
-                                        const rawDataIndex = content.indexOf(targetPrefix);
-                                        if (rawDataIndex !== -1) {
-                                            let rawDataStr = content.substring(rawDataIndex + targetPrefix.length).trim();
-                                            const lastBraceIndex = rawDataStr.lastIndexOf('}');
-                                            if (lastBraceIndex !== -1) {
-                                                rawDataStr = rawDataStr.substring(0, lastBraceIndex + 1);
-                                            }
-                                            
-                                            // Kiểm tra xem data đã đủ chưa (goods và delivery không rỗng)
-                                            try {
-                                                const parsed = JSON.parse(rawDataStr);
-                                                if (parsed && parsed.store && 
-                                                    parsed.store.goods && Object.keys(parsed.store.goods).length > 0 &&
-                                                    parsed.store.delivery && Object.keys(parsed.store.delivery).length > 0) {
-                                                    return rawDataStr; // Dữ liệu đã đủ, trả về
-                                                }
-                                            } catch (e) { /* Bỏ qua lỗi parse, tiếp tục đợi */ }
-                                        }
-                                    }
-                                    // Đợi rồi thử lại
-                                    await new Promise(resolve => setTimeout(resolve, pollInterval));
-                                    elapsedTime += pollInterval;
-                                }
-
-                                // Hết giờ, trả về null để logic bên ngoài xử lý
-                                return null;
-                            }
-                        });
-
-                        if (rawDataString) {
-                            // Đóng tab chi tiết
-                            await chrome.tabs.remove(detailTab.id);
-
-                            currentTrackingStatus = { status: `(${crawledProductIds.size}) Pushing detail for ${product.productId}...`, isTaskRunning: true };
-                            chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: currentTrackingStatus });
-
-                            let productDetailForApi = rawDataString;
-                            try {
-                                const detailObj = JSON.parse(rawDataString);
-                                if (detailObj && detailObj.store) {
-                                    // Chỉ giữ lại các key cần thiết
-                                    const cleanedStore = {
-                                        goods: detailObj.store.goods,
-                                        delivery: detailObj.store.delivery
-                                    };
-                                    const finalObject = { store: cleanedStore };
-                                    productDetailForApi = JSON.stringify(finalObject);
-                                }
-                            } catch (e) {
-                                console.error('Could not clean JSON, sending raw data.', e);
-                            }
-
-                            // Gọi API pushTemuProductDetail
-                            const detailRes = await fetch(DETAIL_API_URL, {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({
-                                    sheetId,
-                                    signature: currentSignature, // Sử dụng signature động
-                                    productId: product.productId,
-                                    productDetail: productDetailForApi
-                                })
-                            });
-
-                            const detailResJson = await detailRes.json();
-                        } else {
-                            // Nếu không thấy rawData, kiểm tra captcha bằng cách tìm div#Picture
-                            const [{ result: hasCaptcha }] = await chrome.scripting.executeScript({
-                                target: { tabId: detailTab.id },
-                                func: () => !!document.getElementById('Picture')
-                            });
-
-                            if (hasCaptcha) {
-                                // Dừng process, hiển thị thông báo, không đóng tab
-                                isTaskRunning = false;
-                                currentTrackingStatus = { status: 'Vui lòng nhập captcha để tiếp tục', isTaskRunning: false };
-                                chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: currentTrackingStatus });
-                                
-                                // Focus vào tab captcha
-                                await chrome.tabs.update(detailTab.id, { active: true });
-                                return; // Dừng toàn bộ function
-                            } else {
-                                // Không tìm thấy dữ liệu và cũng không phải captcha -> Dừng toàn bộ process
-                                isTaskRunning = false;
-                                const statusMessage = `Không tìm thấy dữ liệu cho sản phẩm ${product.productId}. Đã dừng.`;
-                                console.error(statusMessage, `URL: ${product.productLink}`);
-                                currentTrackingStatus = { status: statusMessage, isTaskRunning: false };
-                                chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: currentTrackingStatus });
-
-                                // Focus vào tab để user kiểm tra
-                                await chrome.tabs.update(detailTab.id, { active: true });
-                                return; // Dừng toàn bộ function
-                            }
-                        }
-                    } catch (error) {
-                        console.error('Error in detail crawling:', error);
-                        isTaskRunning = false;
-                        currentTrackingStatus = { status: 'Error: ' + error.message, isTaskRunning: false };
-                        chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: currentTrackingStatus });
-                    }
-                }
             }
-
-            // Tìm và click button "See more"
+            
             const [{ result: clickResult }] = await chrome.scripting.executeScript({
                 target: { tabId },
                 func: () => {
-                    console.log('Searching for See more button...');
-                    
-                    // Tìm button theo class chính xác
                     const button = document.querySelector('div._2ugbvrpI._3E4sGl93._28_m8Owy.R8mNGZXv._2rMaxXAr[role="button"]');
-                    console.log('Found button:', button);
-
                     if (button) {
-                        console.log('Found button, attempting to click...');
-                        try {
-                            button.click();
-                            console.log('Direct click successful');
-                            return { found: true, clicked: true };
-                        } catch (error) {
-                            console.error('Error clicking button:', error);
-                            return { found: true, clicked: false, error: error.message };
-                        }
+                        button.click();
+                        return { success: true };
                     }
-                    
-                    console.log('Button not found');
-                    return { found: false, clicked: false };
+                    return { success: false };
                 }
             });
-
-            console.log('Click result:', clickResult);
-
-            if (!clickResult.found) {
-                hasMoreItems = false;
-                break;
-            }
-
-            if (clickResult.found && !clickResult.clicked) {
-                console.error('Found button but failed to click:', clickResult.error);
-                throw new Error('Failed to click See more button');
-            }
-
-            // Tăng thời gian đợi để đảm bảo trang load xong
-            await new Promise(resolve => setTimeout(resolve, 5000));
+            
+            hasMoreItems = clickResult && clickResult.success;
+            if (hasMoreItems) await new Promise(resolve => setTimeout(resolve, 5000));
         }
+        producerFinished = true;
+        chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: { status: `(Producer) Finished. Found ${crawledProductIds.size} total products.`, isTaskRunning: true } });
+    };
 
-        const finalStatus = pageCount >= MAX_PAGES 
-            ? `Reached maximum ${MAX_PAGES} pages. Total products: ${crawledProductIds.size}`
-            : `Completed! Total products: ${crawledProductIds.size} from ${pageCount} pages`;
+    // --- Luồng CONSUMER: Lấy chi tiết từ queue ---
+    const runConsumer = async () => {
+        let processedCount = 0;
+        let consumerIsPaused = false;
 
-        currentTrackingStatus = { status: finalStatus, isTaskRunning: false };
+        while (true) {
+            if (!isTaskRunning) break;
+            
+            if (consumerIsPaused) {
+                if (producerFinished) break;
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                continue;
+            }
+
+            if (productQueue.length > 0) {
+                const product = productQueue.shift();
+                processedCount++;
+                const currentSignature = `${baseSignature}_page_${product.pageFoundOn}`;
+                chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: { status: `(Consumer) Processing ${processedCount}... Queue: ${productQueue.length}`, isTaskRunning: true } });
+
+                let productDetailForApi;
+                let detailTab;
+                let shouldCloseTab = true;
+
+                try {
+                    detailTab = await chrome.tabs.create({ url: product.productLink, active: false });
+                    const [{ result: executionResult }] = await chrome.scripting.executeScript({
+                        target: { tabId: detailTab.id },
+                        func: async () => {
+                            const totalTimeout = 20000;
+                            const pollInterval = 500;
+                            let elapsedTime = 0;
+
+                            while (elapsedTime < totalTimeout) {
+                                if (document.querySelector('div.DH5-hSGT')) {
+                                    return { status: 'CAPTCHA_DETECTED' };
+                                }
+                                
+                                const scripts = Array.from(document.querySelectorAll('script'));
+                                const targetPrefix = 'window.rawData=';
+                                for (const script of scripts) {
+                                    const content = script.textContent;
+                                    const rawDataIndex = content.indexOf(targetPrefix);
+                                    if (rawDataIndex !== -1) {
+                                        let rawDataStr = content.substring(rawDataIndex + targetPrefix.length).trim();
+                                        const lastBraceIndex = rawDataStr.lastIndexOf('}');
+                                        if (lastBraceIndex !== -1) rawDataStr = rawDataStr.substring(0, lastBraceIndex + 1);
+                                        
+                                        try {
+                                            const parsed = JSON.parse(rawDataStr);
+                                            if (parsed && parsed.store &&
+                                                parsed.store.goods && Object.keys(parsed.store.goods).length > 0 &&
+                                                parsed.store.delivery && Object.keys(parsed.store.delivery).length > 0) {
+                                                return { status: 'SUCCESS', data: rawDataStr };
+                                            }
+                                        } catch (e) { /* Data chưa hoàn chỉnh, tiếp tục đợi */ }
+                                    }
+                                }
+                                await new Promise(resolve => setTimeout(resolve, pollInterval));
+                                elapsedTime += pollInterval;
+                            }
+                            return { status: 'TIMEOUT' };
+                        }
+                    });
+                    
+                    if (executionResult.status === 'SUCCESS') {
+                         const detailObj = JSON.parse(executionResult.data);
+                         const cleanedStore = { goods: detailObj.store.goods, delivery: detailObj.store.delivery };
+                         productDetailForApi = JSON.stringify({ store: cleanedStore });
+                    } else if (executionResult.status === 'CAPTCHA_DETECTED') {
+                        shouldCloseTab = false;
+                        await chrome.tabs.update(detailTab.id, { active: true });
+                        chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: { status: `Captcha detected! Consumer is paused. Producer continues...`, isTaskRunning: true }});
+                        consumerIsPaused = true;
+                        productDetailForApi = JSON.stringify({ error: "Verify captcha" });
+                    } else { // TIMEOUT
+                        throw new Error("Không tìm thấy dữ liệu chi tiết sau 20 giây.");
+                    }
+                } catch (error) {
+                    console.error(`Error processing ${product.productId}:`, error);
+                    productDetailForApi = JSON.stringify({ error: error.message });
+                } finally {
+                    if (detailTab && shouldCloseTab) {
+                        await chrome.tabs.remove(detailTab.id);
+                    }
+                }
+                
+                if (productDetailForApi) {
+                    await fetch(DETAIL_API_URL, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            sheetId,
+                            signature: currentSignature,
+                            productId: product.productId,
+                            productDetail: productDetailForApi
+                        })
+                    });
+                }
+            } else if (producerFinished) {
+                break;
+            } else {
+                await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+        }
+        return consumerIsPaused;
+    };
+
+    // --- Khởi chạy song song và đợi cả 2 hoàn thành ---
+    try {
+        const producerPromise = runProducer();
+        const consumerPromise = ENABLE_CONSUMER ? runConsumer() : Promise.resolve(false);
+
+        const [_, wasPausedByCaptcha] = await Promise.all([producerPromise, consumerPromise]);
+
+        if (!ENABLE_CONSUMER) {
+            currentTrackingStatus = { status: `Producer finished. Consumer was disabled.`, isTaskRunning: false };
+        } else if (wasPausedByCaptcha) {
+            currentTrackingStatus = { status: `Process finished. Producer completed. Consumer was paused due to captcha.`, isTaskRunning: false };
+        } else {
+            currentTrackingStatus = { status: `All tasks completed!`, isTaskRunning: false };
+        }
         isTaskRunning = false;
-        chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: currentTrackingStatus });
-
     } catch (error) {
-        currentTrackingStatus = { status: 'Error: ' + error.message, isTaskRunning: false };
+        console.error("A critical error occurred:", error);
+        currentTrackingStatus = { status: `Critical Error: ${error.message}`, isTaskRunning: false };
         isTaskRunning = false;
-        chrome.runtime.sendMessage({ type: 'CRAWL_ERROR', error: error.message });
+    } finally {
         chrome.runtime.sendMessage({ type: 'UPDATE_STATUS', data: currentTrackingStatus });
+        sendResponse({ success: true });
     }
 }
